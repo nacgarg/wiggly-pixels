@@ -35,12 +35,35 @@ struct RenderState {
     last_frame_start: std::time::Instant,
 }
 
+struct FragParams<'a> {
+    // location of pixel in screen/camera space
+    p: Vec3,
+
+    // barycentric coords
+    u: f32,
+    v: f32,
+    w: f32,
+
+    // triangle in screen/camera space
+    tri: &'a Tri,
+}
+
 #[derive(Debug)]
 struct Camera {
     pos: Vec3,
     rot: na::Rotation3<f32>,
     pub near_clip_plane: f32,
     pub hfov: f32,
+}
+
+#[derive(Debug)]
+pub struct Renderer {
+    pub width: usize,
+    pub height: usize,
+    pub buffer: Vec<u32>,
+    z_buffer: Vec<f32>,
+    state: RenderState,
+    camera: Camera,
 }
 
 impl Camera {
@@ -51,13 +74,18 @@ impl Camera {
     }
 }
 
-#[derive(Debug)]
-pub struct Renderer {
-    pub width: usize,
-    pub height: usize,
-    pub buffer: Vec<u32>,
-    state: RenderState,
-    camera: Camera,
+impl Tri {
+    fn y_sorted(&self) -> Tri {
+        let mut tmp = vec![self.0, self.1, self.2];
+        tmp.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
+        assert!(tmp[0].y <= tmp[1].y);
+        assert!(tmp[1].y <= tmp[2].y);
+        Tri(tmp[0], tmp[1], tmp[2])
+    }
+    fn rounded(&self) -> Tri {
+        let round = |v: Vec3| -> Vec3 { pt!(v.x.round(), v.y.round(), v.z) };
+        Tri(round(self.0), round(self.1), round(self.2))
+    }
 }
 
 impl Renderer {
@@ -66,6 +94,7 @@ impl Renderer {
             width,
             height,
             buffer: vec![0; width * height],
+            z_buffer: vec![std::f32::INFINITY; width * height],
             state: RenderState {
                 t: 0.0,
                 n: 0,
@@ -75,7 +104,7 @@ impl Renderer {
                 pos: pt!(0.0, 0.0, 5.0), // In front of XY plane
                 rot: na::Rotation3::from_axis_angle(&Vec3::x_axis(), std::f32::consts::FRAC_PI_2), // facing negative z
                 near_clip_plane: 0.1,
-                hfov: 1.1,
+                hfov: 1.0,
             },
         }
     }
@@ -93,9 +122,13 @@ impl Renderer {
         }
         self.state.last_frame_start = std::time::Instant::now();
 
+        // Clear display buffer
         for i in self.buffer.iter_mut() {
-            // Clear buffer
             *i = 0x00000000; // __RRGGBB
+        }
+        // Clear z buffer
+        for i in self.z_buffer.iter_mut() {
+            *i = std::f32::INFINITY;
         }
 
         let rot = na::Rotation3::from_axis_angle(&Vec3::x_axis(), self.state.t)
@@ -108,28 +141,24 @@ impl Renderer {
         let d = rot * pt!(0.5, 1.0, 0.5);
 
         let tetra: Vec<Tri> = vec![Tri(a, b, c), Tri(a, b, d), Tri(a, d, c), Tri(d, b, c)];
-        self.wireframe(&tetra, Color::new(0, 255, 0));
+        self.solid(&tetra, &|s, f| -> Option<Color> {
+            // Simple fragment shader that does a z test, writes to z buffer, and does some simple depth shading
+            let col = Color::new(20, 140, 180);
+            let index = f.p.y as usize * s.width + f.p.x as usize;
+            if s.z_buffer[index] < f.p.z {
+                None
+            } else {
+                s.z_buffer[index] = f.p.z;
+                Some(Color::new(
+                    (col.x as f32 * f.p.z / 10.0) as u8,
+                    (col.y as f32 * f.p.z / 10.0) as u8,
+                    (col.z as f32 * f.p.z / 10.0) as u8,
+                ))
+            }
+        });
 
-        self.line(
-            &Line2(
-                pt!(300.0, 300.0),
-                pt!(
-                    300.0 + 300.0 * (self.state.t / 10.0).cos(),
-                    300.0 + 300.0 * (self.state.t / 10.0).sin()
-                ),
-            ),
-            Color::new(255, 255, 0),
-        );
-        self.line(
-            &Line2(
-                pt!(900.0, 900.0),
-                pt!(
-                    300.0 - 300.0 * (self.state.t / 10.0).cos(),
-                    300.0 + 300.0 * (self.state.t / 10.0).sin()
-                ),
-            ),
-            Color::new(255, 255, 0),
-        );
+        self.wireframe(&tetra, Color::new(180, 180, 180));
+
         self.state.n += 1;
         Ok(())
     }
@@ -247,7 +276,7 @@ impl Renderer {
         self.line(&Line2(convpt!(a => Vec2), convpt!(b => Vec2)), col);
     }
 
-    // Placeholder for vertex shader. Eventually should operate on a vertex which has more attributes (color, tex coords) than just a vec3
+    // Placeholder for vertex shader. Eventually should return a vertex which has more attributes (color, tex coords) than just a vec3
     // Output coordinate space is camera space
     fn vertex(&self, vert: &Vec3) -> Vec3 {
         let v4 = na::Vector4::new(vert.x, vert.y, vert.z, 1.0);
@@ -283,6 +312,147 @@ impl Renderer {
             self.line3(&Line3(tri.0, tri.1), col);
             self.line3(&Line3(tri.1, tri.2), col);
             self.line3(&Line3(tri.2, tri.0), col);
+        }
+    }
+    // Helper function for rastering a triangle
+    fn scanline<F>(&mut self, mut x1: f32, mut x2: f32, y: f32, frag: &F, tri: &Tri)
+    where
+        F: Fn(&mut Renderer, FragParams) -> Option<Color>,
+    {
+        if x1 > x2 {
+            std::mem::swap(&mut x1, &mut x2);
+        }
+        if y < 0.0 || y > self.height as f32 - 1.0 {
+            return;
+        }
+        if x1 < 0.0 {
+            x1 = 0.0;
+        } else if x1 > self.width as f32 - 1.0 {
+            x1 = self.width as f32 - 1.0;
+        }
+        if x2 < 0.0 {
+            x2 = 0.0;
+        } else if x2 > self.width as f32 - 1.0 {
+            x2 = self.width as f32 - 1.0;
+        }
+        for x in (x1 as u16)..(x2 as u16) {
+            // Get barycentric coords of triangle to pass to fragment shader
+            // adapted from https://gamedev.stackexchange.com/questions/23743/whats-the-most-efficient-way-to-find-barycentric-coordinates
+            let p = pt!(x as f32, y, 0.0);
+            let v0 = tri.1 - tri.0;
+            let v1 = tri.2 - tri.0;
+            let v2 = p - tri.0;
+
+            let d00 = v0.dot(&v0);
+            let d01 = v0.dot(&v1);
+            let d11 = v1.dot(&v1);
+            let d20 = v2.dot(&v0);
+            let d21 = v2.dot(&v1);
+            let denom = d00 * d11 - (d01 * d01);
+            let v = (d11 * d20 - (d01 * d21)) / denom;
+            let w = (d00 * d21 - (d01 * d20)) / denom;
+            let u = 1.0 - v - w;
+            let z = u * tri.0.z + v * tri.1.z + w * tri.2.z;
+            let pos = pt!(x as f32, y, z);
+            let col = frag(
+                self,
+                FragParams {
+                    p: pos,
+                    u,
+                    v,
+                    w,
+                    tri,
+                },
+            );
+            match col {
+                Some(c) => {
+                    self.plot(Vec2::new(x as f32, y), c);
+                }
+                None => {
+                    // don't render anything
+                }
+            }
+        }
+    }
+
+    // Raster a triangle using a given fragment shader
+    fn tri<F>(&mut self, tri: &Tri, frag: &F)
+    where
+        F: Fn(&mut Renderer, FragParams) -> Option<Color>,
+    {
+        let tri_proj = Tri(
+            self.pixel(&self.vertex(&tri.0)),
+            self.pixel(&self.vertex(&tri.1)),
+            self.pixel(&self.vertex(&tri.2)),
+        );
+
+        let sorted = tri_proj.y_sorted().rounded();
+
+        let bottom_tri = |t: &Tri, s: &mut Renderer| {
+            let slope = (
+                (t.1.x - t.0.x) / (t.1.y - t.0.y),
+                (t.2.x - t.0.x) / (t.2.y - t.0.y),
+            );
+            let mut x1 = t.0.x;
+            let mut x2 = t.0.x;
+            let mut y: i16 = t.0.y.round() as i16;
+            loop {
+                if y >= t.1.y.round() as i16 {
+                    break;
+                }
+                s.scanline(x1.round(), x2.round(), y.into(), frag, &sorted);
+                x1 += slope.0;
+                x2 += slope.1;
+                y += 1;
+            }
+        };
+
+        let top_tri = |t: &Tri, s: &mut Renderer| {
+            let slope = (
+                (t.2.x - t.0.x) / (t.2.y - t.0.y),
+                (t.2.x - t.1.x) / (t.2.y - t.1.y),
+            );
+            let mut x1 = t.2.x;
+            let mut x2 = t.2.x;
+            let mut y: i16 = t.2.y.round() as i16;
+            loop {
+                if y < t.0.y.round() as i16 {
+                    break;
+                }
+                s.scanline(x1.round(), x2.round(), y.into(), frag, &sorted);
+                x1 -= slope.0;
+                x2 -= slope.1;
+                y -= 1;
+            }
+        };
+
+        if sorted.1.y.round() == sorted.2.y.round() {
+            bottom_tri(&sorted, self);
+        } else if sorted.0.y.round() == sorted.1.y.round() {
+            top_tri(&sorted, self);
+        } else {
+            let intersection = if sorted.2.x < sorted.0.x {
+                (sorted.0.x
+                    + (sorted.1.y - sorted.0.y) / (sorted.2.y - sorted.0.y)
+                        * (sorted.2.x - sorted.0.x))
+                    .round()
+            } else {
+                (sorted.0.x
+                    + (sorted.1.y - sorted.0.y) / (sorted.2.y - sorted.0.y)
+                        * (sorted.2.x - sorted.0.x))
+                    .round()
+            };
+            let split = pt!(intersection, sorted.1.y.round(), 0.0);
+            bottom_tri(&Tri(sorted.0, sorted.1, split), self);
+            top_tri(&Tri(split, sorted.1, sorted.2), self);
+        }
+    }
+    fn solid<F>(&mut self, mesh: &Vec<Tri>, frag: &F)
+    where
+        F: Fn(&mut Renderer, FragParams) -> Option<Color>,
+    {
+        for tri in mesh.iter() {
+            self.tri(tri, frag);
         }
     }
 }
