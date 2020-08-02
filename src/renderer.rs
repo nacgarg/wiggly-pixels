@@ -1,9 +1,12 @@
 extern crate nalgebra as na;
+extern crate tobj;
 
 type Color = na::Vector3<u8>;
 type Vec2 = na::Vector2<f32>;
 type Vec3 = na::Vector3<f32>;
-struct Tri(Vec3, Vec3, Vec3);
+#[derive(Clone, Copy)]
+pub struct Tri(Vec3, Vec3, Vec3);
+pub type Mesh = Vec<Tri>;
 
 #[derive(Debug)]
 struct Line2(Vec2, Vec2);
@@ -35,7 +38,7 @@ struct RenderState {
     last_frame_start: std::time::Instant,
 }
 
-struct FragParams<'a> {
+pub struct FragParams<'a> {
     // location of pixel in screen/camera space
     p: Vec3,
 
@@ -46,24 +49,60 @@ struct FragParams<'a> {
 
     // triangle in screen/camera space
     tri: &'a Tri,
+
+    // scene time in seconds
+    t: f32,
 }
 
-#[derive(Debug)]
-struct Camera {
-    pos: Vec3,
-    rot: na::Rotation3<f32>,
+pub struct Camera {
+    pub pos: Vec3,
+    pub rot: na::Rotation3<f32>,
     pub near_clip_plane: f32,
     pub hfov: f32,
 }
 
-#[derive(Debug)]
+pub struct Object {
+    pub pos: Vec3,
+    pub rot: na::Rotation3<f32>,
+    pub mesh: Mesh,
+    pub shader: Box<dyn Fn(&mut Renderer, FragParams) -> Option<Color>>,
+}
+
 pub struct Renderer {
     pub width: usize,
     pub height: usize,
     pub buffer: Vec<u32>,
     z_buffer: Vec<f32>,
     state: RenderState,
-    camera: Camera,
+}
+
+pub struct Scene {
+    pub camera: Camera,
+    pub objects: Vec<Object>,
+}
+
+pub fn rotate_mesh(mesh: &Mesh, rot: na::Rotation3<f32>) -> Mesh {
+    let mut ret = mesh.clone();
+    for tri in ret.iter_mut() {
+        tri.0 = rot * tri.0;
+        tri.1 = rot * tri.1;
+        tri.2 = rot * tri.2;
+    }
+    ret.to_vec()
+}
+
+impl Object {
+    pub fn new<F: 'static>(mesh: Mesh, frag: F) -> Object
+    where
+        F: Fn(&mut Renderer, FragParams) -> Option<Color>,
+    {
+        Object {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            rot: na::Rotation3::identity(),
+            mesh,
+            shader: Box::new(frag),
+        }
+    }
 }
 
 impl Camera {
@@ -88,9 +127,87 @@ impl Tri {
     }
 }
 
+impl Scene {
+    pub fn new() -> Self {
+        let mut ret = Self {
+            camera: Camera {
+                pos: pt!(0.0, 0.0, 50.0), // In front of XY plane
+                rot: na::Rotation3::from_axis_angle(&Vec3::x_axis(), std::f32::consts::FRAC_PI_2), // facing negative z
+                near_clip_plane: 0.1,
+                hfov: 1.0,
+            },
+            objects: Vec::new(),
+        };
+        ret.init();
+        ret
+    }
+    pub fn init(&mut self) {
+        let a = pt!(0.0, 0.0, 0.0);
+        let b = pt!(1.0, 0.0, 0.0);
+        let c = pt!(0.5, 0.0, 1.0);
+        let d = pt!(0.5, 1.0, 0.5);
+
+        let tetra: Mesh = vec![Tri(a, b, c), Tri(a, b, d), Tri(a, d, c), Tri(d, b, c)];
+        self.objects
+            .push(Object::new(tetra, |s, f| -> Option<Color> {
+                // Simple fragment shader that does a z test, writes to z buffer, and does some simple depth shading
+                let col = Color::new(20, 140, 180);
+                let index = f.p.y as usize * s.width + f.p.x as usize;
+                if s.z_buffer[index] <= f.p.z {
+                    None
+                } else {
+                    s.z_buffer[index] = f.p.z;
+                    Some(Color::new(
+                        (col.x as f32 * f.p.z / 10.0) as u8,
+                        (col.y as f32 * f.p.z / 10.0) as u8,
+                        (col.z as f32 * f.p.z / 10.0) as u8,
+                    ))
+                }
+            }));
+
+        let (models, _) = tobj::load_obj("cow.obj", false).expect("Failed to load file");
+        let m = &models[0].mesh;
+        let mut mesh = Mesh::new();
+        let mut next_face = 0;
+        for f in 0..m.num_face_indices.len() {
+            let end = next_face + m.num_face_indices[f] as usize;
+            let face_indices: Vec<_> = m.indices[next_face..end].iter().collect();
+            let vert = |i: usize, j: usize| m.positions[3 * *face_indices[i] as usize + j];
+
+            mesh.push(Tri(
+                pt!(vert(0, 0), vert(0, 1), vert(0, 2)),
+                pt!(vert(1, 0), vert(1, 1), vert(1, 2)),
+                pt!(vert(2, 0), vert(2, 1), vert(2, 2)),
+            ));
+            next_face = end;
+        }
+
+        self.objects
+            .push(Object::new(mesh, |s, f| -> Option<Color> {
+                let col = Color::new(255, 105, 180);
+                let index = f.p.y as usize * s.width + f.p.x as usize;
+                if s.z_buffer[index] <= f.p.z {
+                    None
+                } else {
+                    s.z_buffer[index] = f.p.z;
+                    let mut normal = (f.tri.1 - f.tri.0).cross(&(f.tri.2 - f.tri.0));
+                    normal = normal / normal.norm();
+                    let mut light = Vec3::new(f.t.sin(), f.t.cos(), (f.t*0.1).cos());
+                    light = light / light.norm();
+                    let dot = (normal.dot(&light)).abs();
+                    Some(Color::new(
+                        (col.x as f32 * (1.0 - dot)) as u8,
+                        (col.y as f32 * (1.0 - dot)) as u8,
+                        (col.z as f32 * (1.0 - dot)) as u8,
+                    ))
+                }
+            }));
+    }
+}
+
 impl Renderer {
-    pub fn new(width: usize, height: usize) -> Renderer {
-        Renderer {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
             width,
             height,
             buffer: vec![0; width * height],
@@ -100,15 +217,9 @@ impl Renderer {
                 n: 0,
                 last_frame_start: std::time::Instant::now(),
             },
-            camera: Camera {
-                pos: pt!(0.0, 0.0, 5.0), // In front of XY plane
-                rot: na::Rotation3::from_axis_angle(&Vec3::x_axis(), std::f32::consts::FRAC_PI_2), // facing negative z
-                near_clip_plane: 0.1,
-                hfov: 1.0,
-            },
         }
     }
-    pub fn draw(&mut self) -> Result<(), String> {
+    pub fn draw(&mut self, scene: &Scene) -> Result<(), String> {
         let dt = self.state.last_frame_start.elapsed().as_secs_f32();
         self.state.t += dt;
         let n = self.state.n;
@@ -135,29 +246,17 @@ impl Renderer {
             * na::Rotation3::from_axis_angle(&Vec3::y_axis(), self.state.t / 2.0)
             * na::Rotation3::from_axis_angle(&Vec3::z_axis(), self.state.t / 1.5);
 
-        let a = rot * pt!(0.0, 0.0, 0.0);
-        let b = rot * pt!(1.0, 0.0, 0.0);
-        let c = rot * pt!(0.5, 0.0, 1.0);
-        let d = rot * pt!(0.5, 1.0, 0.5);
+        for obj in scene.objects.iter() {
+            self.solid(&rotate_mesh(&obj.mesh, rot), &obj.shader, &scene.camera);
+            // self.wireframe(&rotate_mesh(&obj.mesh, rot), Color::new(255, 255, 255), &scene.camera);
+        }
 
-        let tetra: Vec<Tri> = vec![Tri(a, b, c), Tri(a, b, d), Tri(a, d, c), Tri(d, b, c)];
-        self.solid(&tetra, &|s, f| -> Option<Color> {
-            // Simple fragment shader that does a z test, writes to z buffer, and does some simple depth shading
-            let col = Color::new(20, 140, 180);
-            let index = f.p.y as usize * s.width + f.p.x as usize;
-            if s.z_buffer[index] < f.p.z {
-                None
-            } else {
-                s.z_buffer[index] = f.p.z;
-                Some(Color::new(
-                    (col.x as f32 * f.p.z / 10.0) as u8,
-                    (col.y as f32 * f.p.z / 10.0) as u8,
-                    (col.z as f32 * f.p.z / 10.0) as u8,
-                ))
-            }
-        });
-
-        self.wireframe(&tetra, Color::new(180, 180, 180));
+        // To display z buffer
+        // let mut i=0;
+        // for a in self.buffer.iter_mut() {
+        //     *a = self.z_buffer[i] as u32;
+        //     i += 1;
+        // }
 
         self.state.n += 1;
         Ok(())
@@ -269,29 +368,29 @@ impl Renderer {
         }
     }
 
-    fn line3(&mut self, line: &Line3, col: Color) {
-        let a = self.pixel(&self.vertex(&line.0));
-        let b = self.pixel(&self.vertex(&line.1));
+    fn line3(&mut self, line: &Line3, col: Color, camera: &Camera) {
+        let a = self.pixel(&self.vertex(&line.0, camera), camera);
+        let b = self.pixel(&self.vertex(&line.1, camera), camera);
 
         self.line(&Line2(convpt!(a => Vec2), convpt!(b => Vec2)), col);
     }
 
     // Placeholder for vertex shader. Eventually should return a vertex which has more attributes (color, tex coords) than just a vec3
     // Output coordinate space is camera space
-    fn vertex(&self, vert: &Vec3) -> Vec3 {
+    fn vertex(&self, vert: &Vec3, camera: &Camera) -> Vec3 {
         let v4 = na::Vector4::new(vert.x, vert.y, vert.z, 1.0);
-        let p_camera = convpt!(self.camera.transform_matrix() * v4 => Vec3);
+        let p_camera = convpt!(camera.transform_matrix() * v4 => Vec3);
         pt!(
-            self.camera.near_clip_plane * p_camera.x / -p_camera.z,
-            self.camera.near_clip_plane * p_camera.y / -p_camera.z,
+            camera.near_clip_plane * p_camera.x / -p_camera.z,
+            camera.near_clip_plane * p_camera.y / -p_camera.z,
             -p_camera.z
         )
     }
 
     // Convert camera space to pixel space
-    fn pixel(&self, p: &Vec3) -> Vec3 {
+    fn pixel(&self, p: &Vec3, camera: &Camera) -> Vec3 {
         let aspect = self.width as f32 / self.height as f32;
-        let canvas_width = (self.camera.hfov / 2.0).tan() * self.camera.near_clip_plane;
+        let canvas_width = (camera.hfov / 2.0).tan() * camera.near_clip_plane;
         let canvas_height = canvas_width / aspect;
 
         let normalized = pt!(
@@ -307,11 +406,11 @@ impl Renderer {
         )
     }
 
-    fn wireframe(&mut self, mesh: &Vec<Tri>, col: Color) {
+    fn wireframe(&mut self, mesh: &Mesh, col: Color, camera: &Camera) {
         for tri in mesh.iter() {
-            self.line3(&Line3(tri.0, tri.1), col);
-            self.line3(&Line3(tri.1, tri.2), col);
-            self.line3(&Line3(tri.2, tri.0), col);
+            self.line3(&Line3(tri.0, tri.1), col, camera);
+            self.line3(&Line3(tri.1, tri.2), col, camera);
+            self.line3(&Line3(tri.2, tri.0), col, camera);
         }
     }
     // Helper function for rastering a triangle
@@ -337,6 +436,7 @@ impl Renderer {
         }
         for x in (x1 as u16)..(x2 as u16) {
             // Get barycentric coords of triangle to pass to fragment shader
+            // TODO: move this elsewhere so it only happens if we need it in the shader
             // adapted from https://gamedev.stackexchange.com/questions/23743/whats-the-most-efficient-way-to-find-barycentric-coordinates
             let p = pt!(x as f32, y, 0.0);
             let v0 = tri.1 - tri.0;
@@ -362,6 +462,7 @@ impl Renderer {
                     v,
                     w,
                     tri,
+                    t: self.state.t,
                 },
             );
             match col {
@@ -376,14 +477,14 @@ impl Renderer {
     }
 
     // Raster a triangle using a given fragment shader
-    fn tri<F>(&mut self, tri: &Tri, frag: &F)
+    fn tri<F>(&mut self, tri: &Tri, frag: &F, camera: &Camera)
     where
         F: Fn(&mut Renderer, FragParams) -> Option<Color>,
     {
         let tri_proj = Tri(
-            self.pixel(&self.vertex(&tri.0)),
-            self.pixel(&self.vertex(&tri.1)),
-            self.pixel(&self.vertex(&tri.2)),
+            self.pixel(&self.vertex(&tri.0, camera), camera),
+            self.pixel(&self.vertex(&tri.1, camera), camera),
+            self.pixel(&self.vertex(&tri.2, camera), camera),
         );
 
         let sorted = tri_proj.y_sorted().rounded();
@@ -447,12 +548,12 @@ impl Renderer {
             top_tri(&Tri(split, sorted.1, sorted.2), self);
         }
     }
-    fn solid<F>(&mut self, mesh: &Vec<Tri>, frag: &F)
+    fn solid<F>(&mut self, mesh: &Mesh, frag: &F, camera: &Camera)
     where
         F: Fn(&mut Renderer, FragParams) -> Option<Color>,
     {
         for tri in mesh.iter() {
-            self.tri(tri, frag);
+            self.tri(tri, frag, camera);
         }
     }
 }
